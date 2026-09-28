@@ -2,6 +2,7 @@
 CLI — python -m informatica_to_dbt <command> …
 
     assess  <export.xml | dir/>  [--html out.html] [--md out.md] [--json out.json]     week-1 product: the assessment
+    convert <export.xml | dir/>  --out dbt_project/ [--project-name X] [--profile P]      week-2 product: the dbt project
     inspect <export.xml>         [--mapping NAME]                                       dump the canonical model of one mapping
     registry                                                                            print the transformation-type registry
 """
@@ -21,6 +22,9 @@ def _build_parser() -> argparse.ArgumentParser:
     i = sub.add_parser("inspect", help="print the canonical model of an export (or one mapping) as JSON")
     i.add_argument("input", type=Path); i.add_argument("--mapping")
     sub.add_parser("registry", help="print the transformation-type registry")
+    c = sub.add_parser("convert", help="write a dbt project (one model per PowerCenter target) from an export file or directory")
+    c.add_argument("input", type=Path); c.add_argument("--out", type=Path, required=True); c.add_argument("--project-name", default="informatica_conversion")
+    c.add_argument("--profile"); c.add_argument("--no-iceberg", action="store_true")
     return p
 
 
@@ -42,6 +46,12 @@ def main(argv=None) -> int:
                 print(json.dumps(f.summary(), indent=2))
         if a.mapping: print(f"mapping {a.mapping!r} not found", file=sys.stderr); return 1
         return 0
+    if a.cmd == "convert":
+        from .parser import parse_export_dir
+        from .project import write_project
+        folders = parse_export_dir(a.input) if a.input.is_dir() else parse_export_all(a.input)
+        summ = write_project(folders, a.out, project_name=a.project_name, profile=a.profile, iceberg=not a.no_iceberg)
+        print(json.dumps(summ, indent=2)); return 0
     results = assess_export(a.input, report_html=a.html, report_md=a.md, results_json=a.json)
     print(render_assessment_md(results, inputs=[str(a.input)]))
     for out in (a.html, a.md, a.json):

@@ -43,6 +43,7 @@ def _port(el: ET.Element) -> Port:
                 scale=el.get("SCALE", ""), porttype=el.get("PORTTYPE", ""), expression=el.get("EXPRESSION", "") or "",
                 expressiontype=el.get("EXPRESSIONTYPE", "") or "", default_value=el.get("DEFAULTVALUE", "") or "",
                 keytype=el.get("KEYTYPE", "") or "", nullable=el.get("NULLABLE", "") or "",
+                group=el.get("GROUP", "") or "", ref_field=el.get("REF_FIELD", "") or "",
                 attrs={a.get("NAME", ""): a.get("VALUE", "") for a in el if a.tag in ("TRANSFORMFIELDATTR", "FIELDATTRIBUTE")})
 
 

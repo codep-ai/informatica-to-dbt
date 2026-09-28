@@ -31,6 +31,8 @@ class Port:
     default_value: str = ""
     keytype: str = ""              # source/target fields: PRIMARY KEY, FOREIGN KEY, NOT A KEY
     nullable: str = ""
+    group: str = ""                # Router / Union: the GROUP this port belongs to
+    ref_field: str = ""            # Router output ports: the input port they mirror (REF_FIELD)
     attrs: Dict[str, str] = field(default_factory=dict)
 
     @property
