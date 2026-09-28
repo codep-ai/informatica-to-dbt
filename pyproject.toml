@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "informatica-to-dbt"
+version = "0.1.0"
+description = "Informatica PowerCenter repository exports (powrmart XML) → assessment, then dbt models on Apache Iceberg and Airflow DAGs"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.9"
+dependencies = []
+[project.optional-dependencies]
+dev = ["pytest"]
+[project.scripts]
+informatica-to-dbt = "informatica_to_dbt.__main__:main"
+[tool.setuptools.packages.find]
+include = ["informatica_to_dbt*"]
