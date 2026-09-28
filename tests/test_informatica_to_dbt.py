@@ -145,6 +145,7 @@ class TestAssessment:
         assert "PowerCenter" in html and "</body>" in html
         assert json.loads((tmp_path / "a.json").read_text())[0]["folder"] == "SALES_DW"
 
+
     def test_cli_assess(self, capsys):
         from informatica_to_dbt.__main__ import main
         assert main(["assess", str(SALES)]) == 0
