@@ -88,7 +88,7 @@ class TestRegistry:
     @pytest.mark.parametrize("t,expected,status", [
         ("Expression", "Expression", "convert"), ("Source Qualifier", "Source Qualifier", "convert"),
         ("Lookup Procedure", "Lookup", "convert"), ("Sequence", "Sequence Generator", "convert"),
-        ("Update Strategy", "Update Strategy", "todo"), ("Normalizer", "Normalizer", "skip"),
+        ("Update Strategy", "Update Strategy", "convert"), ("Rank", "Rank", "convert"), ("Normalizer", "Normalizer", "skip"),
         ("Java Transformation", "Java", "skip"), ("Something New", "Other", "skip"), ("", "Other", "skip")])
     def test_resolve(self, t, expected, status):
         spec = resolve_transformation(t)
@@ -109,7 +109,7 @@ class TestClassifier:
         assert d["decision"] == "todo"
         assert "aggregator_passthrough" in d["features"]       # CURRENCY / STATUS are not grouped
         assert "dd_insert" in d["features"]
-        assert any("Update Strategy" in r for r in d["reasons"])
+        assert not any("Update Strategy" in r for r in d["reasons"])   # DD_INSERT-only → plain table, no TODO
         assert d["n_targets"] == 2
 
     def test_legacy_skip(self, sales):
@@ -151,3 +151,72 @@ class TestAssessment:
         assert main(["assess", str(SALES)]) == 0
         out = capsys.readouterr().out
         assert "Informatica PowerCenter → dbt · assessment" in out and "m_DIM_CUSTOMER" in out
+
+
+class TestWorkflows:
+    def test_workflow_renders_dag(self, sales):
+        from informatica_to_dbt.workflows import render_workflow
+        r = render_workflow(sales, sales.workflows[0], model_names={"m_DIM_CUSTOMER": ["m_dim_customer__dim_customer"]})
+        assert r["ok"], r["validation"]
+        assert r["dag_id"] == "infa_wf_nightly_sales" and r["n_jobs"] == 7
+        src = r["source"]
+        assert "dbt build --select m_dim_customer__dim_customer" in src
+        assert "cmd_archive_files" in src and "mv $PMTargetFileDir" in src
+        assert ("s_m_dim_customer", "s_m_fact_order_daily", "all_success") in r["edges"]
+        assert any("dec_ORDERS_LOADED" in t for t in r["todos"])          # decision task → placeholder TODO
+        assert any("Post SQL" in t for t in r["todos"])                   # session post SQL flagged
+        assert any("m_FACT_INVOICE" in t or "s_m_FACT_INVOICE" in t for t in r["todos"])
+
+    def test_convert_writes_project_and_dags(self, tmp_path):
+        from informatica_to_dbt.project import write_project
+        summ = write_project([parse_export(SALES)], tmp_path, project_name="infa_sales_dw", iceberg=False)
+        assert summ["models"] == 4 and summ["skipped"] == 1 and summ["dags"] == 1
+        assert (tmp_path / "airflow" / "infa_wf_nightly_sales.py").exists()
+        assert (tmp_path / "models" / "sales_dw" / "_sources.yml").exists()
+        md = (tmp_path / "models" / "sales_dw" / "CONVERSION.md").read_text()
+        assert "workflow wf_NIGHTLY_SALES" in md
+        compile((tmp_path / "airflow" / "infa_wf_nightly_sales.py").read_text(), "dag", "exec")
+
+
+class TestTodoRules:
+    """2026-09-28 design rules: Update Strategy → merge with soft delete on the target key; Rank → row_number() <= N."""
+
+    def _variant(self, old: str, new: str):
+        return parse_export(SALES.read_text(encoding="utf-8").replace(old, new))
+
+    def test_update_strategy_merge_soft_delete(self):
+        from informatica_to_dbt.compiler import compile_mapping
+        f = self._variant('VALUE="DD_INSERT"', 'VALUE="IIF(GROSS_AMOUNT &gt; 0, DD_UPDATE, DD_DELETE)"')
+        m = f.mapping("m_FACT_ORDER_DAILY")
+        assert "update_strategy_no_key" not in classify_mapping(m, f)["features"]      # target has PRIMARY KEY ports
+        out = {o.target: o for o in compile_mapping(m, f)}["FACT_ORDER_DAILY"]
+        assert out.materialization == "incremental" and out.unique_key == ["customer_id", "order_date"]
+        for piece in ("incremental_strategy=var('infa_incremental_strategy', 'merge')", "row_hash", "is_deleted",
+                      "when _dd_op = 2 then true", "coalesce(_dd_op, 0) <> 3", "t.row_hash <> s.row_hash",
+                      "var('infa_soft_delete_missing', true)", "is_incremental()"):
+            assert piece in out.sql, piece
+
+    def test_update_strategy_without_key_is_flagged(self):
+        f = parse_export(SALES.read_text(encoding="utf-8").replace('VALUE="DD_INSERT"', 'VALUE="DD_UPDATE"')
+                         .replace('KEYTYPE="PRIMARY KEY"', 'KEYTYPE="NOT A KEY"'))
+        d = classify_mapping(f.mapping("m_FACT_ORDER_DAILY"), f)
+        assert "update_strategy_no_key" in d["features"] and d["decision"] == "todo"
+
+    def test_rank_top_n(self):
+        from informatica_to_dbt.compiler import compile_mapping
+        rank = ('<TRANSFORMATION NAME="RNK_TOP" REUSABLE="NO" TYPE="Rank">'
+                '<TRANSFORMFIELD DATATYPE="decimal" NAME="CUSTOMER_ID" PORTTYPE="INPUT/OUTPUT" EXPRESSIONTYPE="GROUPBY"/>'
+                '<TRANSFORMFIELD DATATYPE="date/time" NAME="ORDER_DATE" PORTTYPE="INPUT/OUTPUT"/>'
+                '<TRANSFORMFIELD DATATYPE="string" NAME="CURRENCY" PORTTYPE="INPUT/OUTPUT"/>'
+                '<TRANSFORMFIELD DATATYPE="decimal" NAME="ORDER_COUNT" PORTTYPE="INPUT/OUTPUT"/>'
+                '<TRANSFORMFIELD DATATYPE="decimal" NAME="GROSS_AMOUNT" PORTTYPE="INPUT/OUTPUT/MASTER"/>'
+                '<TRANSFORMFIELD DATATYPE="decimal" NAME="RANKINDEX" PORTTYPE="OUTPUT"/>'
+                '<TABLEATTRIBUTE NAME="Top/Bottom" VALUE="Top"/><TABLEATTRIBUTE NAME="Number Of Ranks" VALUE="3"/></TRANSFORMATION>')
+        xml = SALES.read_text(encoding="utf-8")
+        start = xml.index('<TRANSFORMATION DESCRIPTION="" NAME="UPD_INSERT"'); end = xml.index("</TRANSFORMATION>", start) + len("</TRANSFORMATION>")
+        xml = xml[:start] + rank.replace("RNK_TOP", "UPD_INSERT") + xml[end:]
+        xml = xml.replace('TRANSFORMATION_TYPE="Update Strategy"', 'TRANSFORMATION_TYPE="Rank"').replace('TOINSTANCETYPE="Update Strategy"', 'TOINSTANCETYPE="Rank"').replace('FROMINSTANCETYPE="Update Strategy"', 'FROMINSTANCETYPE="Rank"')
+        f = parse_export(xml); m = f.mapping("m_FACT_ORDER_DAILY")
+        assert classify_mapping(m, f)["transformation_types"].get("Rank") == 1
+        out = {o.target: o for o in compile_mapping(m, f)}["FACT_ORDER_DAILY"]
+        assert "row_number() over (partition by" in out.sql and "desc)" in out.sql and "<= 3" in out.sql, out.sql

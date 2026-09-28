@@ -86,6 +86,14 @@ def _features_of(inst: Instance, t: Transformation) -> List[str]:
     return sorted(set(f))
 
 
+def _targets_keyed(m: Mapping, folder: Folder | None) -> bool:
+    tdefs = {t.name: t for t in (folder.targets if folder else [])}
+    for ti in m.target_instances:
+        td = tdefs.get(ti.transformation_name or ti.name)
+        if td is None or not any(p.keytype.upper() == "PRIMARY KEY" for p in td.fields): return False
+    return bool(m.target_instances)
+
+
 def classify_mapping(m: Mapping, folder: Folder | None = None) -> Dict[str, Any]:
     types: Counter = Counter()
     instance_rows: List[Dict[str, Any]] = []
@@ -104,6 +112,8 @@ def classify_mapping(m: Mapping, folder: Folder | None = None) -> Dict[str, Any]
         spec = resolve_transformation(ttype)
         types[spec.name] += 1
         feats = _features_of(inst, t) if t else ["definition_missing"]
+        if spec.family == "update_strategy" and set(feats) & {"dd_update", "dd_delete", "dd_reject"} and not _targets_keyed(m, folder):
+            feats.append("update_strategy_no_key")          # the merge needs KEYTYPE="PRIMARY KEY" on the target definition
         if not ttype and t is None:
             spec = resolve_transformation("Mapplet") if inst.type.upper() == "MAPPLET" else spec
         features += feats

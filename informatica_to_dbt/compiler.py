@@ -51,9 +51,10 @@ class Relation:
     where: List[str] = field(default_factory=list)
     distinct: bool = False
     origin: str = ""                            # instance that produced the base (for merging branches)
+    dd: Optional[str] = None                    # Update Strategy row operation (SQL → 0 insert/1 update/2 delete/3 reject); None = insert-only
 
     def copy(self) -> "Relation":
-        return Relation(self.base, dict(self.cols), list(self.joins), list(self.where), self.distinct, self.origin)
+        return Relation(self.base, dict(self.cols), list(self.joins), list(self.where), self.distinct, self.origin, self.dd)
 
 
 def _id(name: str) -> str:
@@ -223,15 +224,32 @@ def _sorter(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
     return out
 
 
-def _update_strategy(ctx: _Ctx, inst: Instance, t: Transformation, out_model: ModelOut) -> Relation:
+def _update_strategy(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
+    """DD_INSERT-only → a plain table. Anything else → the target becomes a merge on its primary key (see _merge_model)."""
     rel = ctx.input_relation(inst.name); pm = ctx.port_map(inst.name)
     out = rel.copy(); out.cols = {p.name: pm[p.name] for p in t.ports if p.name in pm}
-    expr = t.attr("Update Strategy Expression", "DD_INSERT").upper().strip()
-    if expr in ("DD_INSERT", "0"): out_model.materialization = "table"
-    else:
-        out_model.materialization = "incremental"
-        ctx.todos.append(f"{inst.name}: update strategy '{expr}' → incremental model; confirm unique_key and DD_UPDATE/DD_DELETE handling")
+    expr = t.attr("Update Strategy Expression", "DD_INSERT").strip()
+    if expr.upper() not in ("DD_INSERT", "0"):
+        out.dd = _translate(ctx, expr, pm, f"{inst.name}.strategy")
     return out
+
+
+def _rank(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
+    """Top/Bottom N per group → row_number() over (partition by <group-by ports> order by <rank port>) <= N, as RANKINDEX."""
+    rel = ctx.input_relation(inst.name); pm = ctx.port_map(inst.name)
+    out = rel.copy(); out.cols = {p.name: pm[p.name] for p in t.ports if p.name in pm}
+    group = [p.name for p in t.ports if p.expressiontype.upper() == "GROUPBY" and p.name in pm]
+    rank_port = next((p.name for p in t.ports if ("MASTER" in p.porttype.upper() or p.attrs.get("Rank Port", "").upper() == "YES") and p.name in pm), None)
+    idx = next((p.name for p in t.ports if p.name.upper() == "RANKINDEX"), "RANKINDEX")
+    if not rank_port:
+        ctx.todos.append(f"{inst.name}: rank port not identified — set the ORDER BY of {idx}"); rank_port = None
+    n = int(re.sub(r"\D", "", t.attr("Number Of Ranks", "1")) or 1)
+    order = f"{pm[rank_port]} {'asc' if t.attr('Top/Bottom', 'Top').lower().startswith('bottom') else 'desc'}" if rank_port else "1"
+    part = ("partition by " + ", ".join(pm[g] for g in group) + " ") if group else ""
+    out.cols[idx] = f"row_number() over ({part}order by {order})"
+    m = ctx.materialize(out, inst.name)                 # a window column cannot be filtered in the same SELECT
+    m.where.append(f"{m.cols[idx]} <= {n}")
+    return m
 
 
 _JOIN = {"normal join": "inner join", "master outer join": "left join", "detail outer join": "right join", "full outer join": "full outer join"}
@@ -370,7 +388,6 @@ def compile_mapping(m: Mapping, folder: Optional[Folder] = None) -> List[ModelOu
     for i in m.transformation_instances:
         if ctx.is_seq(i.name) and i.transformation:
             ctx.seq[i.name] = (int(i.transformation.attr("Start Value", "1") or 1), int(i.transformation.attr("Increment By", "1") or 1))
-    proto = ModelOut(name="", target="", sql="", portable_sql="", decision=decision["decision"])
     for name in _topo(ctx):
         inst = ctx.inst[name]
         if inst.type.upper() != "TRANSFORMATION" or inst.transformation is None: continue
@@ -380,7 +397,8 @@ def compile_mapping(m: Mapping, folder: Optional[Folder] = None) -> List[ModelOu
         elif fam == "projection": ctx.rel[name] = _expression(ctx, inst, t)
         elif fam == "filter": ctx.rel[name] = _filter(ctx, inst, t)
         elif fam == "sort": ctx.rel[name] = _sorter(ctx, inst, t)
-        elif fam == "update_strategy": ctx.rel[name] = _update_strategy(ctx, inst, t, proto)
+        elif fam == "update_strategy": ctx.rel[name] = _update_strategy(ctx, inst, t)
+        elif fam == "rank": ctx.rel[name] = _rank(ctx, inst, t)
         elif fam == "join": ctx.rel[name] = _joiner(ctx, inst, t)
         elif fam == "aggregate": ctx.rel[name] = _aggregator(ctx, inst, t)
         elif fam == "router": _router(ctx, inst, t)
@@ -402,16 +420,50 @@ def compile_mapping(m: Mapping, folder: Optional[Folder] = None) -> List[ModelOu
             fd = next((p for p in (tdef.fields if tdef else []) if p.name == fname), None)
             meta.append({"name": _id(fname), "datatype": fd.datatype if fd else "", "keytype": fd.keytype if fd else ""})
             if fd and fd.keytype.upper() == "PRIMARY KEY": keys.append(_id(fname))
-        final = f"select {'distinct ' if rel.distinct else ''}{', '.join(sel)}\nfrom {rel.base}"
-        for j in rel.joins: final += f"\n{j}"
-        if rel.where: final += "\nwhere " + "\n  and ".join(f"({w})" for w in rel.where)
-        cfg = f"materialized={_q(proto.materialization)}" + (f", unique_key={keys!r}" if proto.materialization == "incremental" and keys else "")
-        sql = f"{{{{ config({cfg}) }}}}\n\nwith\n" + ",\n".join(ctx.ctes[:shared_ctes]) + f"\n\n{final}\n" if ctx.ctes else f"{{{{ config({cfg}) }}}}\n\n{final}\n"
+        if rel.dd is not None and not keys:
+            ctx.todos.append(f"{tg.name}: Update Strategy needs the target's primary key — define it in Informatica (KEYTYPE) and re-export; plain table emitted")
+        if rel.dd is not None and keys:
+            materialization = "incremental"
+            sql = _merge_model(ctx.ctes[:shared_ctes], rel, sel, [_id(f) for f in fields], keys)
+        else:
+            materialization = "table"
+            final = f"select {'distinct ' if rel.distinct else ''}{', '.join(sel)}\nfrom {rel.base}"
+            for j in rel.joins: final += f"\n{j}"
+            if rel.where: final += "\nwhere " + "\n  and ".join(f"({w})" for w in rel.where)
+            cfg = f"materialized={_q(materialization)}"
+            sql = f"{{{{ config({cfg}) }}}}\n\nwith\n" + ",\n".join(ctx.ctes[:shared_ctes]) + f"\n\n{final}\n" if ctx.ctes else f"{{{{ config({cfg}) }}}}\n\n{final}\n"
         sql = finalize_macro_args(sql)
         if "/* TODO" in sql: ctx.todos.append(f"{tg.name}: inline TODO markers in the SQL (date/regex formats to verify on the target)")
         outs.append(ModelOut(name=_id(tg.name), target=tg.transformation_name or tg.name, mapping=m.name, sql=sql, portable_sql=sql, decision=decision["decision"],
-                             todos=sorted(set(ctx.todos)), sources=_sources_used(ctx), columns=meta, materialization=proto.materialization, unique_key=keys))
+                             todos=sorted(set(ctx.todos)), sources=_sources_used(ctx), columns=meta, materialization=materialization, unique_key=keys))
     return outs
+
+
+def _merge_model(ctes: List[str], rel: Relation, sel: List[str], cols: List[str], keys: List[str]) -> str:
+    """Update Strategy → merge on the target (Donny 2026-09-28): key matches and row_hash differs → update; new key → insert;
+    key gone from the source → soft delete (is_deleted = true, var infa_soft_delete_missing, default on); DD_DELETE rows → soft
+    delete; DD_REJECT rows → dropped; key and hash match → unchanged (not in the batch)."""
+    non_key = [c for c in cols if c not in keys] or keys
+    hash_parts = ", \"'|'\", ".join(f'"coalesce(cast({c} as " ~ _str ~ "), \'\')"' for c in non_key)
+    on = lambda a, b: " and ".join(f"{a}.{k} = {b}.{k}" for k in keys)
+    stream = f"select {', '.join(sel)}, ({rel.dd}) as _dd_op\n    from {rel.base}"
+    for j in rel.joins: stream += f"\n    {j}"
+    if rel.where: stream += "\n    where " + "\n      and ".join(f"({w})" for w in rel.where)
+    col_list = ", ".join(cols)
+    s_cols = ", ".join(f"s.{c}" for c in cols); t_cols = ", ".join(f"t.{c}" for c in cols)
+    body = ",\n".join(ctes + [
+        f"_stream as (\n    {stream}\n)",
+        f"_src as (\n    select {col_list},\n        {{{{ dbt.hash(dbt.concat([{hash_parts}])) }}}} as row_hash,\n"
+        f"        case when _dd_op = 2 then true else false end as is_deleted\n    from _stream\n    where coalesce(_dd_op, 0) <> 3\n)"])
+    return (f"{{{{ config(materialized='incremental', incremental_strategy=var('infa_incremental_strategy', 'merge'), unique_key={keys!r}, "
+            f"on_schema_change='append_new_columns') }}}}\n{{% set _str = dbt.type_string() %}}\n\nwith\n{body}\n\n"
+            f"{{% if is_incremental() %}}\n"
+            f"select {s_cols}, s.row_hash, s.is_deleted, {{{{ dbt.current_timestamp() }}}} as dbt_updated_at\nfrom _src s\n"
+            f"left join {{{{ this }}}} t on {on('t', 's')}\nwhere t.{keys[0]} is null or t.row_hash <> s.row_hash or t.is_deleted <> s.is_deleted\n"
+            f"{{% if var('infa_soft_delete_missing', true) %}}\nunion all\n"
+            f"select {t_cols}, t.row_hash, true as is_deleted, {{{{ dbt.current_timestamp() }}}} as dbt_updated_at\nfrom {{{{ this }}}} t\n"
+            f"left join _src s on {on('s', 't')}\nwhere s.{keys[0]} is null and not t.is_deleted\n{{% endif %}}\n"
+            f"{{% else %}}\nselect {col_list}, row_hash, is_deleted, {{{{ dbt.current_timestamp() }}}} as dbt_updated_at\nfrom _src\n{{% endif %}}\n")
 
 
 def _sources_used(ctx: _Ctx) -> List[Dict[str, str]]:

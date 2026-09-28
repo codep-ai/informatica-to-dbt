@@ -57,9 +57,11 @@ _reg(TransformationSpec("Lookup", ("Lookup Procedure", "Lookup"), "lookup", "con
 _reg(TransformationSpec("Sequence Generator", ("Sequence Generator", "Sequence"), "sequence", "convert",
                         "NEXTVAL → row_number() over () + start value (MVP); CURRVAL → the same value. Cross-run continuity is a TODO.",
                         todo_when=("sequence_shared",)))
-_reg(TransformationSpec("Update Strategy", ("Update Strategy",), "update_strategy", "todo",
-                        "DD_INSERT-only → append. Conditional DD_UPDATE/DD_INSERT → incremental model with unique_key (TODO to confirm keys); DD_DELETE/DD_REJECT → flagged."))
-_reg(TransformationSpec("Rank", ("Rank",), "rank", "todo", "Top/Bottom N per group → row_number() over (partition by … order by …) <= N."))
+_reg(TransformationSpec("Update Strategy", ("Update Strategy",), "update_strategy", "convert",
+                        "DD_INSERT-only → table. Otherwise → incremental merge on the target primary key with a row hash: update on hash change, "
+                        "insert new keys, soft delete (is_deleted) DD_DELETE rows and keys gone from the source, drop DD_REJECT rows.",
+                        todo_when=("update_strategy_no_key",)))
+_reg(TransformationSpec("Rank", ("Rank",), "rank", "convert", "Top/Bottom N per group → row_number() over (partition by … order by …) <= N, as RANKINDEX."))
 _reg(TransformationSpec("Normalizer", ("Normalizer",), "normalizer", "skip", "Occurs → UNPIVOT / UNION ALL per occurrence; VSAM normalizers are out of scope."))
 _reg(TransformationSpec("Transaction Control", ("Transaction Control",), "control", "skip", "Commit/rollback control has no dbt equivalent; batch semantics only."))
 _reg(TransformationSpec("Stored Procedure", ("Stored Procedure",), "procedural", "skip", "Pre/post stored procedures → dbt hooks at best; connected ones need a rewrite."))

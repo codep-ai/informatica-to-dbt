@@ -1,7 +1,7 @@
 # informatica-to-dbt
 
-Informatica PowerCenter repository exports (powrmart XML) → an **assessment** and a **dbt project** (one model per target, on Apache
-Iceberg by default); Airflow DAGs for the workflows next. Deterministic first, agent second: the code decides what it can convert, flags what it cannot, and never guesses.
+Informatica PowerCenter repository exports (powrmart XML) → an **assessment**, a **dbt project** (one model per target, on Apache
+Iceberg by default) and **Airflow DAGs** for the workflows. Deterministic first, agent second: the code decides what it can convert, flags what it cannot, and never guesses.
 
 Part of the [DATAP.AI](https://datap.ai) open, engine-neutral data layer. Sibling of the Control-M → Airflow converter. Apache-2.0.
 
@@ -55,7 +55,8 @@ Generator; Update Strategy and Rank as `todo`. `informatica_to_dbt/registry.py` 
 1. **Assessment** — done: parser, canonical model, registry, classifier, workflow findings, report.
 2. **Compile** — done for the MVP set: expression language → portable dbt SQL with cross-database macros; row-stream compiler →
    one dbt model per target with sources and key tests. Verified by a real `dbt build` of the synthetic project on DuckDB
-   (4 models, 8 tests). Next: workflows → Airflow (sessions → dbt run, links → dependencies, command tasks → Bash).
+   (4 models, 8 tests). Workflows → Airflow DAGs: sessions → `dbt build --select …`, command tasks → Bash, links → dependencies,
+   decision/event/email tasks → placeholders with TODOs.
 3. **Long tail** — an agent (Claude by default) over the same tools for what Tier 1 flags; parity run when a customer estate exists.
 
 Out of scope for the MVP: unconnected/dynamic lookups, Normalizer, Update Strategy beyond insert, Transaction Control,
