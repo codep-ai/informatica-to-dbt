@@ -38,17 +38,43 @@ def _attrs(el: ET.Element) -> Dict[str, str]:
     return out
 
 
+_BOM = "\ufeff"
+_BOM_MOJIBAKE = "\u00ef\u00bb\u00bf"      # the same three bytes when the export declares a single-byte encoding (seen: windows-1252)
+
+
+def _clean(v: Optional[str]) -> str:
+    """Attribute text as the engine sees it: real exports carry a UTF-8 BOM inside the first flat-file column name and inside
+    expressions that reference it (Lookup condition `CustomerId = \ufeffCustomerId`)."""
+    return (v or "").replace(_BOM, "")
+
+
 def _port(el: ET.Element) -> Port:
     return Port(name=el.get("NAME", ""), datatype=el.get("DATATYPE", ""), precision=el.get("PRECISION", ""),
                 scale=el.get("SCALE", ""), porttype=el.get("PORTTYPE", ""), expression=el.get("EXPRESSION", "") or "",
                 expressiontype=el.get("EXPRESSIONTYPE", "") or "", default_value=el.get("DEFAULTVALUE", "") or "",
                 keytype=el.get("KEYTYPE", "") or "", nullable=el.get("NULLABLE", "") or "",
                 group=el.get("GROUP", "") or "", ref_field=el.get("REF_FIELD", "") or "",
-                attrs={a.get("NAME", ""): a.get("VALUE", "") for a in el if a.tag in ("TRANSFORMFIELDATTR", "FIELDATTRIBUTE")})
+                attrs={**({"INPUTGROUPNAME": el.get("INPUTGROUPNAME")} if el.get("INPUTGROUPNAME") else {}),
+                       **{a.get("NAME", ""): a.get("VALUE", "") for a in el if a.tag in ("TRANSFORMFIELDATTR", "FIELDATTRIBUTE")}})
+
+
+# Real exports (seen in public PowerCenter 8.x–10.x exports) emit several built-in types as TYPE="Custom Transformation" with the
+# actual kind in TEMPLATENAME. Hand-written samples never do, which is why this went unnoticed until the public corpus was run.
+_CUSTOM_TEMPLATES = {"union transformation": "Union", "java transformation": "Java Transformation", "http transformation": "HTTP",
+                     "sql transformation": "SQL", "unstructured data transformation": "Unstructured Data",
+                     "data masking transformation": "Data Masking", "web services consumer transformation": "Web Service Consumer"}
+
+
+def _effective_type(el: ET.Element) -> str:
+    t = el.get("TYPE", "") or ""
+    if t.lower() == "custom transformation":
+        tpl = (el.get("TEMPLATENAME", "") or "").strip().lower()
+        return _CUSTOM_TEMPLATES.get(tpl, t)
+    return t
 
 
 def _transformation(el: ET.Element) -> Transformation:
-    t = Transformation(name=el.get("NAME", ""), type=el.get("TYPE", ""), reusable=_bool(el.get("REUSABLE")),
+    t = Transformation(name=el.get("NAME", ""), type=_effective_type(el), reusable=_bool(el.get("REUSABLE")),
                        description=el.get("DESCRIPTION", "") or "", attributes=_attrs(el),
                        ref_source=el.get("REF_SOURCE_NAME", "") or "", ref_dbd=el.get("REF_DBD_NAME", "") or "")
     t.ports = [_port(f) for f in el if f.tag == "TRANSFORMFIELD"]
@@ -143,6 +169,9 @@ def _workflow(el: ET.Element) -> Workflow:
 
 
 def _parse_tree(root: ET.Element, source_file: str = "") -> List[Folder]:
+    for el in root.iter():                       # BOM inside attribute values (first flat-file column, expressions naming it)
+        for k, v in el.attrib.items():
+            if _BOM in v or _BOM_MOJIBAKE in v: el.attrib[k] = v.replace(_BOM, "").replace(_BOM_MOJIBAKE, "")
     folders: List[Folder] = []
     repo_name, repo_ver = "", ""
     if root.tag == "POWERMART":
@@ -182,8 +211,8 @@ def _resolve_instances(f: Folder) -> None:
             if i.type.upper() != "TRANSFORMATION":
                 continue
             i.transformation = inline.get(i.transformation_name) or reusable.get(i.transformation_name) or inline.get(i.name)
-            if i.transformation and not i.transformation_type:
-                i.transformation_type = i.transformation.type
+            if i.transformation and (not i.transformation_type or i.transformation_type.lower() == "custom transformation"):
+                i.transformation_type = i.transformation.type      # the INSTANCE says "Custom Transformation"; the definition knows it is a Union
 
 
 def _safe_parse(path: PathLike) -> ET.Element:

@@ -62,13 +62,27 @@ Generator; Update Strategy and Rank as `todo`. `informatica_to_dbt/registry.py` 
 Out of scope for the MVP: unconnected/dynamic lookups, Normalizer, Update Strategy beyond insert, Transaction Control,
 Stored Procedure/Java, mapplet flattening, SQL-override rewriting, pushdown, session overrides. Each is flagged, not guessed.
 
-## Corpus and claims
+## Corpus and claims — measured on real exports
 
-`sample_exports/SALES_DW.xml` is a **synthetic** export written against the DTD: four mappings, one workflow, sessions with
-connections and overrides, a reusable transformation, a missing-mapping reference and an orphan. The parser was also run over a
-third-party corpus of 57 real-shaped exports / 157 mappings with zero parse failures on genuine export files; that corpus is
-proprietary and is not included. Conversion rates on that corpus are not published here: they describe that corpus, not yours.
-Run the assessment on your own export; the numbers it prints are the only ones that matter.
+`sample_exports/SALES_DW.xml` and `FINANCE_DW.xml` are **synthetic**, written against the DTD to pin specific transformation
+types. They are not evidence. The evidence is the **bench** on real PowerCenter exports:
+
+```bash
+informatica-to-dbt fetch-public-corpus sample_exports_public      # public exports from GitHub (every export cites powrmart.dtd; needs gh)
+informatica-to-dbt report sample_exports_public --json report.json # parse → classify → compile → write, per file, never stops on one failure
+informatica-to-dbt bench  sample_exports_public --out /tmp/bench --genuine-only --md bench.md   # real dbt build on DuckDB, per model
+```
+
+2026-10-07, 122 public files from 21 repositories, 18 of them genuine Designer exports with mappings: **23 models generated,
+23 build, 0 fail**. The first run was 14/23; the nine failures were converter bugs no hand-written sample could show (Union
+exported as `Custom Transformation`, joiner master ports in `PORTTYPE`, a BOM inside the first flat-file column, an instance named
+`union`, a running-total variable port, a `Credit/Debit` column, same-named lookup condition sides, flat-file lookups). Flat-file
+lookups now become **dbt seeds** (`lkp_<name>`, header + typed properties written; drop the real file in). `tests/test_public_corpus.py`
+keeps the bench at zero failures when the corpus is present. The corpus is other people's files: git-ignored, licences unchecked, a
+test input and never a deliverable.
+
+What is still missing is a real **estate**: the public exports are single training mappings. Nobody has run this on 2,000
+mappings yet, and this README does not claim otherwise.
 
 ## Using it with Claude
 
@@ -79,5 +93,5 @@ It calls this package; it does not replace it.
 
 ```bash
 python -m pytest tests -q                    # parser, registry, classifier, assessment, compiler
-pip install dbt-duckdb && python -m pytest tests/test_informatica_to_dbt_build.py -q   # real dbt build on DuckDB (test bench)
+pip install dbt-duckdb sqlglot && python -m pytest tests/test_informatica_to_dbt_build.py tests/test_public_corpus.py -q   # real dbt build on DuckDB (test bench) + public-corpus gate
 ```

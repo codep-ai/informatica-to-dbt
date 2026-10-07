@@ -15,25 +15,28 @@ sys.path.insert(0, str(ROOT))
 duckdb = pytest.importorskip("duckdb")
 pytest.importorskip("dbt.adapters.duckdb")
 
-from informatica_to_dbt import parse_export  # noqa: E402
+from informatica_to_dbt import parse_export  # noqa: E402,F401
 from informatica_to_dbt.project import _yml_type, write_project  # noqa: E402
 
-FIX = ROOT / "sample_exports" / "SALES_DW.xml"
+FIXDIR = ROOT / "sample_exports"
 _DUCK = {"numeric": "DECIMAL(38,6)", "bigint": "BIGINT", "integer": "INTEGER", "float": "DOUBLE", "string": "VARCHAR", "timestamp": "TIMESTAMP", "binary": "BLOB"}
 
 
 @pytest.fixture(scope="module")
 def project(tmp_path_factory):
     out = tmp_path_factory.mktemp("infa_dbt")
-    folder = parse_export(FIX)
-    summ = write_project([folder], out, project_name="infa_sales_dw", profile="infa_sales_dw", iceberg=False)
+    from informatica_to_dbt import parse_export_dir
+    folders = parse_export_dir(FIXDIR)
+    summ = write_project(folders, out, project_name="infa_sales_dw", profile="infa_sales_dw", iceberg=False)
     db = out / "bench.duckdb"
     con = duckdb.connect(str(db))
-    for s in folder.sources:
-        schema = s.dbd_name.lower()
-        con.execute(f"create schema if not exists {schema}")
+    for s in [x for f in folders for x in f.sources]:
         cols = ", ".join(f"{p.name.lower()} {_DUCK.get(_yml_type(p.datatype), 'VARCHAR')}" for p in s.fields)
-        con.execute(f"create table if not exists {schema}.{s.name.lower()} ({cols})")
+        # the dbt source schema (DBD) and, for SQL overrides kept verbatim, the owner schema the override names (e.g. GL.GL_JOURNAL_NZ)
+        for schema in {s.dbd_name.lower(), (s.owner or s.dbd_name).lower()}:
+            con.execute(f"create schema if not exists {schema}")
+            con.execute(f"create table if not exists {schema}.{s.name.lower()} ({cols})")
+
     con.close()
     (out / "profiles.yml").write_text(f"infa_sales_dw:\n  target: bench\n  outputs:\n    bench:\n      type: duckdb\n      path: {db}\n      threads: 1\n", encoding="utf-8")
     return out, summ
@@ -54,13 +57,21 @@ def test_generated_project_parses(project):
     assert r.returncode == 0, r.stdout[-3000:] + r.stderr[-1000:]
 
 
+def _verbatim_override_models(out: Path):
+    """Models whose Source Qualifier SQL override was kept verbatim are Oracle SQL by design (a TODO for the engineer); the bench
+    cannot run them and does not pretend to."""
+    return sorted(p.stem for p in out.glob("models/*/*.sql") if "SQL override used verbatim" in p.read_text(encoding="utf-8"))
+
+
 def test_generated_project_builds_on_duckdb(project):
     out, _ = project
-    r = _dbt(out, "build")
+    skip = _verbatim_override_models(out)
+    assert skip == ["fact_gl_top_accounts"]
+    r = _dbt(out, "build", *(["--exclude", *skip] if skip else []))
     assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-1000:]
     results = json.loads((out / "target" / "run_results.json").read_text())["results"]
     statuses = {x["unique_id"]: x["status"] for x in results}
     models = {k: v for k, v in statuses.items() if k.startswith("model.")}
     tests = {k: v for k, v in statuses.items() if k.startswith("test.")}
-    assert len(models) == 4 and all(v == "success" for v in models.values()), statuses
+    assert len(models) == 4 and all(v == "success" for v in models.values()), statuses   # SALES_DW; FINANCE_DW's model carries a verbatim override
     assert tests and all(v == "pass" for v in tests.values()), statuses

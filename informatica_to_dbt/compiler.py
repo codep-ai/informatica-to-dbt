@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .classifier import classify_mapping
 from .expressions import finalize_macro_args, to_portable_sql
@@ -41,6 +41,7 @@ class ModelOut:
     materialization: str = "table"
     unique_key: List[str] = field(default_factory=list)
     dialect_error: Optional[str] = None
+    seeds: List[Dict[str, Any]] = field(default_factory=list)       # flat-file lookups → dbt seeds: {name, columns[(name, datatype)]}
 
 
 @dataclass
@@ -57,13 +58,30 @@ class Relation:
         return Relation(self.base, dict(self.cols), list(self.joins), list(self.where), self.distinct, self.origin, self.dd)
 
 
+_RESERVED = {"union", "select", "from", "where", "group", "order", "by", "join", "on", "as", "and", "or", "not", "in", "is", "null", "case",
+             "when", "then", "else", "end", "table", "with", "all", "distinct", "having", "limit", "left", "right", "inner", "outer", "full",
+             "cross", "using", "values", "insert", "update", "delete", "into", "set", "default", "primary", "key", "references", "create",
+             "drop", "alter", "index", "view", "cast", "exists", "between", "like", "over", "partition", "window", "filter", "data", "date",
+             "time", "timestamp", "user", "count", "sum", "min", "max", "avg", "check", "column", "constraint", "desc", "asc", "nulls", "first",
+             "last", "true", "false", "row", "rows", "range", "current", "unique", "any", "some", "except", "intersect", "lateral", "natural"}
+
+
 def _id(name: str) -> str:
-    s = re.sub(r"[^0-9a-zA-Z_]+", "_", name).strip("_").lower()
-    return s if s and not s[0].isdigit() else f"t_{s}"
+    s = re.sub(r"[^0-9a-zA-Z_]+", "_", name.replace("\ufeff", "")).strip("_").lower()
+    if not s or s[0].isdigit(): s = f"t_{s}"
+    return f"{s}_" if s in _RESERVED else s
 
 
 def _q(s: str) -> str:
     return "'" + s.replace("'", "''") + "'"
+
+
+def _col(alias: str, physical: str) -> str:
+    """Reference to a physical source column. Plain identifiers go lower-case unquoted (the adapter resolves case); anything else
+    (`credit/debit`, `Order Date`) is quoted through the adapter so the engine sees the column exactly as the source defines it."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", physical) and physical.lower() not in _RESERVED:
+        return f"{alias}.{physical.lower()}"
+    return f'{alias}.{{{{ adapter.quote({_q(physical)}) }}}}'
 
 
 class _Ctx:
@@ -78,6 +96,7 @@ class _Ctx:
         self.todos: List[str] = []
         self.seq: Dict[str, Tuple[int, int]] = {}
         self.materialized: Set[str] = set()
+        self.seeds: List[Dict[str, Any]] = []
 
     def upstreams(self, name: str) -> List[str]:
         out: List[str] = []
@@ -141,7 +160,7 @@ class _Ctx:
         """Write `rel` as a CTE and return the relation over it (columns become plain references)."""
         cid = _id(name)
         use = cols or list(rel.cols)
-        sel = ", ".join(f"{rel.cols[c]} as {_id(c)}" for c in use)
+        sel = ", ".join(f"{rel.cols[c]} as {_id(c)}" for c in use) or "1 as _one"
         body = f"select {'distinct ' if rel.distinct else ''}{sel}\n    from {rel.base}"
         for j in rel.joins: body += f"\n    {j}"
         if rel.where: body += "\n    where " + "\n      and ".join(f"({w})" for w in rel.where)
@@ -168,7 +187,7 @@ def _source_qualifier(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
     cols: Dict[str, str] = {}
     for p in t.ports:
         src = ctx.inputs.get(inst.name, {}).get(p.name)
-        if src: cols[p.name] = f"{_id(src[0])}.{_id(src[1])}"
+        if src: cols[p.name] = _col(_id(src[0]), src[1])
     if a.get("sql query", "").strip():
         ctx.todos.append(f"{inst.name}: SQL override used verbatim; rewrite as dbt sources")
         cid = _id(inst.name); ctx.ctes.append(f"{cid} as (\n    -- TODO SQL override of Source Qualifier {inst.name}\n    {a['sql query'].strip()}\n)")
@@ -191,7 +210,7 @@ def _source_qualifier(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
 def _qualify(ctx: _Ctx, expr: str, srcs: List[str]) -> str:
     sql = to_portable_sql(expr).sql
     for s in srcs:
-        sql = re.sub(rf"(?<![\w.]){re.escape(s)}\.(\w+)", lambda mm, s=s: f"{_id(s)}.{_id(mm.group(1))}", sql, flags=re.I)
+        sql = re.sub(rf"(?<![\w.]){re.escape(s)}\.(\w+)", lambda mm, s=s: _col(_id(s), mm.group(1)), sql, flags=re.I)
     return sql
 
 
@@ -199,7 +218,13 @@ def _expression(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
     rel = ctx.input_relation(inst.name); pm = ctx.port_map(inst.name)
     var_sql: Dict[str, str] = {}
     for p in t.ports:
-        if p.is_variable: var_sql[p.name] = "(" + _translate(ctx, p.expression, {**pm, **var_sql}, f"{inst.name}.{p.name}") + ")"
+        if not p.is_variable: continue
+        if re.search(rf"(?<![\w.]){re.escape(p.name)}(?![\w(])", p.expression or ""):
+            ctx.todos.append(f"{inst.name}.{p.name}: variable port references its own previous-row value (running state); SQL has no row order — "
+                             f"rewrite as a window function (e.g. sum() over (order by …)); previous value taken as 0")
+            var_sql[p.name] = "(" + _translate(ctx, p.expression, {**pm, **var_sql, p.name: "0"}, f"{inst.name}.{p.name}") + ")"
+        else:
+            var_sql[p.name] = "(" + _translate(ctx, p.expression, {**pm, **var_sql}, f"{inst.name}.{p.name}") + ")"
     out = rel.copy(); out.cols = {}
     for p in t.ports:
         if not p.is_output: continue
@@ -256,7 +281,8 @@ _JOIN = {"normal join": "inner join", "master outer join": "left join", "detail 
 
 
 def _joiner(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
-    master = {p.name for p in t.ports if p.attrs.get("Master", "").upper() == "YES"}
+    master = {p.name for p in t.ports if p.attrs.get("Master", "").upper() == "YES" or "MASTER" in p.porttype.upper()
+              or p.attrs.get("INPUTGROUPNAME", "").upper() == "MASTER"}
     m_up = d_up = None
     for p in t.ports:
         src = ctx.inputs.get(inst.name, {}).get(p.name)
@@ -271,7 +297,9 @@ def _joiner(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
         if not src: continue
         side = m_rel if p.name in master else d_rel
         if src[1] in side.cols: pm[p.name] = side.cols[src[1]]
-    cond = _translate(ctx, t.attr("Join Condition") or "1=1", pm, f"{inst.name}.join")
+    cond_src = re.sub(r"(?i)\b(MASTER|DETAIL)\.", "", t.attr("Join Condition") or "1=1")   # some tools qualify ports by input group
+    cond = _translate(ctx, cond_src, pm, f"{inst.name}.join")
+    if not pm: ctx.todos.append(f"{inst.name}: no joiner port could be resolved to an upstream column — check the connectors into it")
     jt = _JOIN.get(t.attr("Join Type", "Normal Join").lower(), "inner join")     # detail drives; Master Outer keeps all detail rows
     rel = Relation(base=d_rel.base, cols={p.name: pm[p.name] for p in t.ports if p.name in pm}, joins=[f"{jt} {m_rel.base} on {cond}"], origin=inst.name)
     return ctx.materialize(rel, inst.name)
@@ -340,6 +368,10 @@ def _union(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
     return Relation(base=cid, cols={p.name: f"{cid}.{_id(p.name)}" for p in outs}, origin=inst.name)
 
 
+def _is_flat_file_lookup(a: Dict[str, str]) -> bool:
+    return a.get("source type", "").strip().lower().startswith("flat") and not a.get("lookup sql override", "").strip()
+
+
 def _lookup(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
     a = {k.lower(): v for k, v in {**t.attributes, **inst.attributes}.items()}
     rel = ctx.input_relation(inst.name); pm = ctx.port_map(inst.name)
@@ -348,12 +380,32 @@ def _lookup(ctx: _Ctx, inst: Instance, t: Transformation) -> Relation:
     table = a.get("lookup table name", "") or inst.name
     conn = _id(a.get("connection information", "") or "lookup")
     cond_src = a.get("lookup condition", "").strip()
-    cond = to_portable_sql(cond_src).sql if cond_src else "1=1"
-    for p in lk_ports: cond = re.sub(rf"(?<![\w.]){re.escape(p.name)}(?![\w])", f"{alias}.{_id(p.name)}", cond)
-    for p, v in sorted(pm.items(), key=lambda kv: -len(kv[0])): cond = re.sub(rf"(?<![\w.]){re.escape(p)}(?![\w])", lambda _m, v=v: v, cond)
-    keys = [_id(p.name) for p in lk_ports if re.search(rf"(?<![\w.]){re.escape(p.name)}(?![\w])", cond_src)]
+    # PowerCenter writes every conjunct as <lookup port> <op> <input port>; resolve by POSITION, not by name — in real exports the
+    # two sides can carry the same name (a flat-file column exported with a BOM collides with the lookup port once cleaned).
+    conj: List[str] = []; keys: List[str] = []
+    for part in re.split(r"\s+AND\s+", cond_src, flags=re.I) if cond_src else []:
+        mm = re.fullmatch(r"\s*([\w$]+)\s*(=|!=|<>|>=|<=|>|<)\s*([\w$]+)\s*", part)
+        if mm:
+            lk, op, inp = mm.groups()
+            keys.append(_id(lk))
+            conj.append(f"{alias}.{_id(lk)} {op} {pm.get(inp, _id(inp))}")
+        else:                                              # anything else: name-based best effort (kept from the first version)
+            c = to_portable_sql(part).sql
+            for p in lk_ports: c = re.sub(rf"(?<![\w.]){re.escape(p.name)}(?![\w])", f"{alias}.{_id(p.name)}", c)
+            for p, v in sorted(pm.items(), key=lambda kv: -len(kv[0])): c = re.sub(rf"(?<![\w.]){re.escape(p)}(?![\w])", lambda _m, v=v: v, c)
+            conj.append(c); ctx.todos.append(f"{inst.name}: lookup condition term {part.strip()!r} not in <lookup port> = <input port> form; verify")
+    cond = " and ".join(conj) if conj else "1=1"
     lk_cols = ", ".join(_id(p.name) for p in lk_ports)
-    src_ref = f"{{{{ source({_q(conn)}, {_q(_id(table))}) }}}}"
+    if _is_flat_file_lookup(a):
+        # Donny 2026-10-07: a flat-file lookup is a dbt SEED — ref() it and left join like any table; the converter writes the header
+        # and typed properties, the engineer drops the real file into seeds/.
+        seed = f"lkp_{_id(table)}"
+        ctx.seeds.append({"name": seed, "columns": [(p.name, p.datatype) for p in lk_ports], "instance": inst.name})
+        src_ref = f"{{{{ ref({_q(seed)}) }}}}"
+        ctx.todos.append(f"{inst.name}: flat-file lookup → seed '{seed}' (header written to seeds/; copy the lookup file there — "
+                         f"session attribute 'Lookup source file name')")
+    else:
+        src_ref = f"{{{{ source({_q(conn)}, {_q(_id(table))}) }}}}"
     if a.get("lookup sql override", "").strip():
         sub = a["lookup sql override"].strip(); ctx.todos.append(f"{inst.name}: Lookup SQL override used verbatim")
     elif keys:
@@ -435,7 +487,8 @@ def compile_mapping(m: Mapping, folder: Optional[Folder] = None) -> List[ModelOu
         sql = finalize_macro_args(sql)
         if "/* TODO" in sql: ctx.todos.append(f"{tg.name}: inline TODO markers in the SQL (date/regex formats to verify on the target)")
         outs.append(ModelOut(name=_id(tg.name), target=tg.transformation_name or tg.name, mapping=m.name, sql=sql, portable_sql=sql, decision=decision["decision"],
-                             todos=sorted(set(ctx.todos)), sources=_sources_used(ctx), columns=meta, materialization=materialization, unique_key=keys))
+                             todos=sorted(set(ctx.todos)), sources=_sources_used(ctx), columns=meta, materialization=materialization, unique_key=keys,
+                             seeds=list(ctx.seeds)))
     return outs
 
 
@@ -468,11 +521,16 @@ def _merge_model(ctes: List[str], rel: Relation, sel: List[str], cols: List[str]
 
 def _sources_used(ctx: _Ctx) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []; seen = set()
-    def add(sn, tb, dbd, ident):
-        if (sn, tb) not in seen: seen.add((sn, tb)); out.append({"source_name": sn, "table": tb, "dbd": dbd, "identifier": ident})
+    def add(sn, tb, dbd, ident, columns=None):
+        if (sn, tb) not in seen:
+            seen.add((sn, tb)); out.append({"source_name": sn, "table": tb, "dbd": dbd, "identifier": ident, "columns": columns or []})
     for i in ctx.m.source_instances: add(_id(i.dbd_name or "src"), _id(i.transformation_name or i.name), i.dbd_name, i.transformation_name or i.name)
     for i in ctx.m.transformation_instances:
         if ctx.ttype(i.name).lower().startswith("lookup") and i.transformation:
             a = {k.lower(): v for k, v in i.transformation.attributes.items()}
-            add(_id(a.get("connection information", "") or "lookup"), _id(a.get("lookup table name", "") or i.name), a.get("connection information", ""), a.get("lookup table name", "") or i.name)
+            if _is_flat_file_lookup(a): continue                      # a seed, not a source
+            # the lookup's own ports describe the table when no SOURCE definition exists for it (flat-file lookups, other folders)
+            lk_cols = [(p.name, p.datatype, "") for p in i.transformation.ports if "LOOKUP" in p.porttype.upper() or (p.is_output and not p.is_input)]
+            add(_id(a.get("connection information", "") or "lookup"), _id(a.get("lookup table name", "") or i.name), a.get("connection information", ""),
+                a.get("lookup table name", "") or i.name, lk_cols)
     return out

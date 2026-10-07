@@ -62,7 +62,14 @@ class Transformation:
     ref_dbd: str = ""
 
     def attr(self, name: str, default: str = "") -> str:
-        return self.attributes.get(name, default)
+        """TABLEATTRIBUTE by name, case-insensitive ('Number Of Ranks' vs 'Number of Ranks' both occur in real exports)."""
+        if name in self.attributes:
+            return self.attributes[name]
+        low = name.lower()
+        for k, v in self.attributes.items():
+            if k.lower() == low:
+                return v
+        return default
 
     @property
     def output_ports(self) -> List[Port]:

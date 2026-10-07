@@ -73,7 +73,7 @@ class TestParser:
 
     def test_parse_dir_merges_by_folder(self):
         folders = parse_export_dir(FIXTURES)
-        assert [f.name for f in folders] == ["SALES_DW"]
+        assert sorted(f.name for f in folders) == ["FINANCE_DW", "SALES_DW"]
 
     def test_parse_from_string(self):
         f = parse_export('<POWERMART><REPOSITORY NAME="R"><FOLDER NAME="F"><MAPPING NAME="m" ISVALID="YES"/></FOLDER></REPOSITORY></POWERMART>')
@@ -138,12 +138,12 @@ class TestAssessment:
 
     def test_assess_export_writes_reports(self, tmp_path):
         results = assess_export(FIXTURES, report_html=tmp_path / "a.html", report_md=tmp_path / "a.md", results_json=tmp_path / "a.json")
-        assert len(results) == 1
+        assert len(results) == 2 and {r["folder"] for r in results} == {"SALES_DW", "FINANCE_DW"}
         md = (tmp_path / "a.md").read_text()
-        assert "| Mappings | 4 |" in md and "m_FACT_INVOICE" in md and "m_ORPHAN_EXPORT" in md
+        assert "| Mappings | 5 |" in md and "m_FACT_INVOICE" in md and "m_ORPHAN_EXPORT" in md
         html = (tmp_path / "a.html").read_text()
         assert "PowerCenter" in html and "</body>" in html
-        assert json.loads((tmp_path / "a.json").read_text())[0]["folder"] == "SALES_DW"
+        assert {r["folder"] for r in json.loads((tmp_path / "a.json").read_text())} == {"SALES_DW", "FINANCE_DW"}
 
 
     def test_cli_assess(self, capsys):
@@ -220,3 +220,25 @@ class TestTodoRules:
         assert classify_mapping(m, f)["transformation_types"].get("Rank") == 1
         out = {o.target: o for o in compile_mapping(m, f)}["FACT_ORDER_DAILY"]
         assert "row_number() over (partition by" in out.sql and "desc)" in out.sql and "<= 3" in out.sql, out.sql
+
+
+class TestFinanceFixture:
+    def test_union_rank_lookup_update_strategy(self):
+        from informatica_to_dbt.compiler import compile_mapping
+        f = parse_export(FIXTURES / "FINANCE_DW.xml")
+        d = classify_mapping(f.mapping("m_GL_TOP_ACCOUNTS"))
+        assert d["decision"] == "todo"
+        assert {"lookup_unconnected_call", "sql_override", "dd_update", "dd_insert", "dd_reject"} <= set(d["features"])
+        outs = compile_mapping(f.mapping("m_GL_TOP_ACCOUNTS"), f)
+        assert len(outs) == 1 and outs[0].materialization == "incremental" and outs[0].unique_key == ["account_code", "region"]
+        sql = outs[0].sql
+        assert "union all" in sql and "row_number() over (partition by" in sql and "<= 5" in sql
+        assert "TODO SQL override" in sql and "is_incremental()" in sql
+        assert any("LKP_FX_RATE" in t for t in outs[0].todos) and "rankindex" in sql
+
+    def test_finance_workflow_failed_link_and_timer(self):
+        from informatica_to_dbt.workflows import render_workflow
+        f = parse_export(FIXTURES / "FINANCE_DW.xml")
+        r = render_workflow(f, f.workflows[0], model_names={"m_GL_TOP_ACCOUNTS": ["fact_gl_top_accounts"]})
+        assert r["ok"] and ("s_m_gl_top_accounts", "email_on_fail", "all_failed") in r["edges"]
+        assert any("Timer" in t for t in r["todos"]) and any("Pre SQL" in t for t in r["todos"])

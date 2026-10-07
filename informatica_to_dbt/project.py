@@ -8,6 +8,7 @@ adapter renders the portable SQL and the cross-database macros.
     write_project(folders, out_dir, project_name="infa_sales_dw", profile="infa_sales_dw") → summary dict
 """
 from __future__ import annotations
+import json
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -23,6 +24,10 @@ _TYPE = {"number": "numeric", "decimal": "numeric", "bigint": "bigint", "integer
          "date": "timestamp", "date/time": "timestamp", "datetime": "timestamp", "timestamp": "timestamp", "raw": "binary"}
 
 
+_SEED_TYPES = {"numeric": "numeric(38,6)", "bigint": "bigint", "integer": "integer", "float": "double precision", "string": "varchar",
+               "timestamp": "timestamp", "binary": "varchar"}   # seed column_types are engine SQL types; these parse on every adapter we target
+
+
 def _yml_type(dt: str) -> str:
     return _TYPE.get(re.sub(r"\(.*\)", "", (dt or "").strip().lower()), "string")
 
@@ -31,20 +36,39 @@ def _yaml_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def convert_folder(folder: Folder) -> List[ModelOut]:
+def convert_folder(folder: Folder, tier: int = 1, export_path: str = "") -> List[ModelOut]:
+    """Tier 1: the deterministic compiler. Tier 2: the same, then the Claude-first modernizer agent resolves what it can of the
+    TODOs of each mapping that has any (Tier 1 stays the floor; the agent never blocks)."""
     outs: List[ModelOut] = []
+    agent = None
+    if tier >= 2:
+        try:
+            from .modernizer_agent import InformaticaModernizerAgent
+        except ImportError as exc:      # public mirror: Tier 2 (Claude agent) ships with the DATAP.AI platform only
+            raise RuntimeError("Tier 2 needs the DATAP.AI platform package (agents.*) and ANTHROPIC_API_KEY") from exc
+        agent = InformaticaModernizerAgent()
     for m in folder.mappings:
-        outs.extend(compile_mapping(m, folder))
+        t1 = compile_mapping(m, folder)
+        if agent is not None and export_path and any(o.todos and o.decision != "skip" for o in t1):
+            r = agent.modernize_mapping(export_path, m.name, folder)
+            by = {d["name"]: d for d in r["models"]}
+            for o in t1:
+                d = by.get(o.name)
+                if d and r.get("tier") == 2:
+                    o.sql = d["sql"]; o.portable_sql = d["sql"]; o.todos = d["todos"]
+                    if d.get("resolved"): o.todos = list(o.todos) + [f"resolved by Tier 2 agent: {x}" for x in d["resolved"]]
+            for o in t1: o.agent = r.get("agent")  # type: ignore[attr-defined]
+        outs.extend(t1)
     return outs
 
 
 def write_project(folders: List[Folder], out_dir: Path, project_name: str = "informatica_conversion", profile: Optional[str] = None,
-                  materialized_default: str = "table", iceberg: bool = True, dbt_project_dir: Optional[str] = None) -> Dict[str, Any]:
+                  materialized_default: str = "table", iceberg: bool = True, dbt_project_dir: Optional[str] = None, tier: int = 1) -> Dict[str, Any]:
     out_dir = Path(out_dir); models_root = out_dir / "models"
     summary: Dict[str, Any] = {"project": project_name, "folders": [], "models": 0, "skipped": 0, "todos": 0}
     for f in folders:
         fdir = models_root / _id(f.name); fdir.mkdir(parents=True, exist_ok=True)
-        outs = convert_folder(f)
+        outs = convert_folder(f, tier=tier, export_path=(f.source_files[0] if f.source_files else ""))
         # several mappings loading the same target → model per (mapping, target), with a note; one mapping → model per target
         by_target = Counter(o.target for o in outs)
         for o in outs:
@@ -60,13 +84,14 @@ def write_project(folders: List[Folder], out_dir: Path, project_name: str = "inf
             for s in o.sources:
                 sd = sdefs.get(s["identifier"])
                 src_tables[s["source_name"]][s["table"]] = {"identifier": s["identifier"], "dbd": s["dbd"],
-                                                            "columns": [(p.name, p.datatype, p.keytype) for p in (sd.fields if sd else [])]}
+                                                            "columns": [(p.name, p.datatype, p.keytype) for p in sd.fields] if sd else list(s.get("columns") or [])}
             if o.decision == "skip":
                 summary["skipped"] += 1
                 (fdir / f"{o.name}.sql.skipped").write_text("-- NOT CONVERTED (needs review)\n" + "\n".join(f"-- {t}" for t in o.todos) + "\n", encoding="utf-8")
                 conv_md += [f"## {o.name} — SKIPPED", ""] + [f"- {t}" for t in o.todos] + [""]
                 continue
-            header = [f"-- {o.name}: converted from PowerCenter target {o.target} (mapping decision: {o.decision})",
+            tier_note = f"; Tier 2 agent: {getattr(o, 'agent', {}).get('status', 'n/a') if getattr(o, 'agent', None) else 'not run'}" if tier >= 2 else ""
+            header = [f"-- {o.name}: converted from PowerCenter target {o.target} (mapping decision: {o.decision}{tier_note})",
                       "-- Generated by informatica_converter; review every TODO below before enabling."]
             if o.todos: header += ["-- TODO:"] + [f"--   - {t}" for t in o.todos]
             (fdir / f"{o.name}.sql").write_text("\n".join(header) + "\n" + o.sql, encoding="utf-8")
@@ -94,9 +119,28 @@ def write_project(folders: List[Folder], out_dir: Path, project_name: str = "inf
                 if t["columns"]:
                     sy.append("        columns:")
                     for (cn, dt, kt) in t["columns"]:
-                        sy.append(f"          - name: {_id(cn)}" + (f"\n            data_type: {_yml_type(dt)}" if dt else ""))
+                        # a dbt source column is the PHYSICAL column: plain identifiers lower-cased, anything else exactly as the source defines it
+                        phys = cn.lower() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", cn) else cn
+                        sy.append(f"          - name: {json.dumps(phys)}" + (f"\n            data_type: {_yml_type(dt)}" if dt else ""))
         (fdir / "_sources.yml").write_text("\n".join(sy) + "\n", encoding="utf-8")
         (fdir / "_models.yml").write_text("\n".join(model_yml) + "\n", encoding="utf-8")
+        # flat-file lookups → dbt seeds (Donny 2026-10-07): header + typed properties written; the engineer copies the real file over
+        seeds: Dict[str, Dict[str, Any]] = {}
+        for o in outs:
+            for sd in getattr(o, "seeds", []) or []: seeds.setdefault(sd["name"], sd)
+        if seeds:
+            seed_dir = out_dir / "seeds" / _id(f.name); seed_dir.mkdir(parents=True, exist_ok=True)
+            sdy: List[str] = ["version: 2", "", "seeds:"]
+            for name, sd in sorted(seeds.items()):
+                cols = [(_id(cn), _yml_type(dt)) for cn, dt in sd["columns"]]
+                csv = seed_dir / f"{name}.csv"
+                if not csv.exists():                                   # never overwrite a file the engineer has already dropped in
+                    csv.write_text(",".join(c for c, _ in cols) + "\n", encoding="utf-8")
+                sdy += [f"  - name: {name}", f"    description: {_yaml_str('PowerCenter flat-file lookup ' + sd['instance'] + ' — replace the header-only CSV with the lookup file (session attribute Lookup source file name)')}",
+                        "    config:", "      column_types:"] + [f"        {c}: {_SEED_TYPES.get(t, 'varchar')}" for c, t in cols]
+                conv_md += [f"## seed {name}", "", f"- flat-file lookup `{sd['instance']}`: copy the lookup file to `seeds/{_id(f.name)}/{name}.csv` (header written; columns {', '.join(c for c, _ in cols)})", ""]
+            (seed_dir / "_seeds.yml").write_text("\n".join(sdy) + "\n", encoding="utf-8")
+            summary["seeds"] = summary.get("seeds", 0) + len(seeds)
         # workflows → Airflow DAGs (airflow/<dag_id>.py), sessions select the models their mapping produced
         model_names: Dict[str, List[str]] = defaultdict(list)
         for o in outs:
@@ -121,6 +165,7 @@ version: "0.1.0"
 config-version: 2
 profile: {prof}
 model-paths: ["models"]
+seed-paths: ["seeds"]
 target-path: "target"
 clean-targets: ["target", "dbt_packages"]
 require-dbt-version: [">=1.7.0", "<2.0.0"]
