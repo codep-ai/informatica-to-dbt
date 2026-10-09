@@ -17,6 +17,8 @@ functions; render workflows to Airflow. Everything else is flagged, never guesse
 No PowerCenter licence is needed: the parser follows the public repository DTD (powrmart.dtd, grammar 8.x); external DTD
 entities are never fetched.
 """
+__version__ = "0.3.0"   # 0.1 assessment · 0.2 compiler + dbt project · 0.3 Tier 2 agent, real-export fixes, seeds, provenance
+
 from .model import Folder, Mapping, Instance, Transformation, Port, Connector, Session, Workflow, WorkflowLink, TaskInstance
 from .parser import parse_export, parse_export_all, parse_export_dir
 from .registry import TRANSFORMATION_REGISTRY, resolve_transformation, TransformationSpec

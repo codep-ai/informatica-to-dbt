@@ -7,6 +7,7 @@ CLI — python -m informatica_to_dbt <command> …
     registry                                                                            print the transformation-type registry
     report  <dir/>  [--json out.json] [--out projects/]                                 run the whole pipeline over a directory of exports; per-file rows, never stops on one failure
     bench   <dir/>  --out bench/ [--md bench.md] [--json bench.json]                    the acceptance gate: real `dbt build` of every export on DuckDB (needs dbt-duckdb)
+    verify-drift <dbt_project/> [--exports exports/] [--md drift.md]                  which generated files were hand-edited (content_hash) or are stale (export changed)
     fetch-public-corpus <dir/>                                                          pull public PowerCenter exports from GitHub for regression testing (needs gh)
 """
 from __future__ import annotations
@@ -34,6 +35,9 @@ def _build_parser() -> argparse.ArgumentParser:
     b = sub.add_parser("bench", help="real dbt build of every export on DuckDB (test bench); the acceptance gate")
     b.add_argument("input", type=Path); b.add_argument("--out", type=Path, required=True); b.add_argument("--md", type=Path); b.add_argument("--json", type=Path)
     b.add_argument("--genuine-only", action="store_true", help="only files that look like Designer exports (CREATION_DATE, REPOSITORY VERSION, INSTANCE)")
+    vd = sub.add_parser("verify-drift", help="report hand-edited (content_hash) and stale (source_hash vs current export) generated files")
+    vd.add_argument("project", type=Path); vd.add_argument("--exports", type=Path, help="export file or directory to compare source hashes against")
+    vd.add_argument("--md", type=Path)
     fp = sub.add_parser("fetch-public-corpus", help="download public PowerCenter exports from GitHub into a directory")
     fp.add_argument("dest", type=Path); fp.add_argument("--limit", type=int, default=100)
     return p
@@ -78,6 +82,17 @@ def main(argv=None) -> int:
         if a.md: a.md.write_text(md)
         if a.json: a.json.write_text(json.dumps(res, indent=1, default=str))
         print(md); return 0 if not res["summary"].get("fail") else 1
+    if a.cmd == "verify-drift":
+        from .provenance import render_drift_md, source_hash, verify
+        exports = None
+        if a.exports:
+            from .parser import parse_export_dir
+            folders = parse_export_dir(a.exports) if a.exports.is_dir() else parse_export_all(a.exports)
+            exports = {f.name: source_hash([Path(x) for x in f.source_files if Path(x).exists()]) for f in folders}
+        rows = verify(a.project, exports)
+        md = render_drift_md(rows)
+        if a.md: a.md.write_text(md)
+        print(md); return 0 if all(r.status in ("clean", "no-header") for r in rows) else 1
     if a.cmd == "fetch-public-corpus":
         from .corpus import fetch_public_corpus
         print(json.dumps(fetch_public_corpus(a.dest, a.limit), indent=1)); return 0

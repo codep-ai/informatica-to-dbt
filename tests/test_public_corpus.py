@@ -1,5 +1,5 @@
 """Regression gate on REAL PowerCenter exports (public GitHub corpus, fetched with
-`python -m informatica_to_dbt fetch-public-corpus sample_exports_public`; git-ignored, licences unchecked —
+`python -m informatica_to_dbt fetch-public-corpus sample_exports/informatica_public`; git-ignored, licences unchecked —
 a test input, never a deliverable). Skipped when the corpus or dbt-duckdb is absent.
 
 Why: the compiler was first proven on two hand-written exports; the first run over the public corpus (2026-10-07) found five
