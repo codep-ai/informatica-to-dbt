@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 PREFIX = "datapai:"
+NOTEBOOK_MARKER = "# Databricks notebook source"
 _COMMENT = {".sql": "--", ".skipped": "--", ".yml": "#", ".yaml": "#", ".py": "#", ".sh": "#", ".md": "<!--"}
 _FIELDS = ("source_hash", "object", "template_id", "converter_version", "rendered_at", "content_hash")
 
@@ -80,6 +81,8 @@ def parse_header(text: str) -> Optional[Dict[str, str]]:
     lines = text.split("\n")
     out: Dict[str, str] = {}
     n = 0
+    if lines and lines[0].strip() == NOTEBOOK_MARKER:        # Databricks notebooks must start with their marker; the header follows it
+        lines = lines[1:]; n = 0
     for ln in lines[: len(_FIELDS) + 2]:
         m = re.match(r"^\s*(?:--|#|<!--)\s*" + re.escape(PREFIX) + r"([a-z_]+)=(.*?)(?:\s*-->)?\s*$", ln)
         if not m:

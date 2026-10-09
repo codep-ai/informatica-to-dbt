@@ -82,3 +82,17 @@ def test_spark_plans_against_empty_tables():
             spark.sql(s).explain(); planned += 1
     assert planned >= 4
     spark.stop()
+
+
+def test_databricks_jobs_output(tmp_path):
+    from informatica_to_dbt.databricks_jobs import write_databricks_jobs
+    res = write_databricks_jobs([o for _, o in _models()], tmp_path, catalog="azure_datapai_databricks_dev", schema="infa", rendered_at="2026-10-09T00:00:00Z", source_hash="0" * 64, folder="SALES_DW")
+    assert res["jobs"] >= 4 and not res["failed"], res
+    nb = next(tmp_path.glob("databricks_jobs/*.py")).read_text()
+    assert nb.startswith("# Databricks notebook source\n# datapai:source_hash=") and "saveAsTable" in nb
+    from informatica_to_dbt.provenance import parse_header, verify
+    assert parse_header(nb)["template_id"] == "informatica.databricks_notebook"
+    assert all(r.status == "clean" for r in verify(tmp_path, patterns=("databricks_jobs/*.py",)))
+    py_compile.compile(str(next(tmp_path.glob("databricks_jobs/*.py"))), doraise=True)
+    spec = json.loads((tmp_path / "databricks_jobs" / "jobs.json").read_text())["jobs"][0]
+    assert spec["tasks"][0]["notebook_task"]["notebook_path"].endswith(spec["tasks"][0]["task_key"]) and spec["environments"]

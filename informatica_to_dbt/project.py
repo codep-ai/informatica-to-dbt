@@ -65,7 +65,8 @@ def convert_folder(folder: Folder, tier: int = 1, export_path: str = "") -> List
 
 def write_project(folders: List[Folder], out_dir: Path, project_name: str = "informatica_conversion", profile: Optional[str] = None,
                   materialized_default: str = "table", iceberg: bool = True, dbt_project_dir: Optional[str] = None, tier: int = 1,
-                  rendered_at: Optional[str] = None, glue_pyspark: bool = False, glue_target_db: Optional[str] = None) -> Dict[str, Any]:
+                  rendered_at: Optional[str] = None, glue_pyspark: bool = False, glue_target_db: Optional[str] = None,
+                  databricks_jobs: bool = False, databricks_target: Optional[str] = None) -> Dict[str, Any]:
     out_dir = Path(out_dir); models_root = out_dir / "models"
     rendered_at = rendered_at or run_started_at()                       # one run → one timestamp on every artefact (ADOP determinism rule)
     summary: Dict[str, Any] = {"project": project_name, "folders": [], "models": 0, "skipped": 0, "todos": 0, "rendered_at": rendered_at}
@@ -172,6 +173,12 @@ def write_project(folders: List[Folder], out_dir: Path, project_name: str = "inf
             g = write_glue_jobs(outs, out_dir, target_db=glue_target_db or _id(project_name), rendered_at=rendered_at, source_hash=shash, folder=f.name)
             summary.setdefault("glue_jobs", 0); summary["glue_jobs"] += g["jobs"]
             if g["failed"]: summary.setdefault("glue_failed", []).extend(g["failed"])
+        if databricks_jobs:                                # optional Databricks output (Azure plan A3); same compiled models
+            from .databricks_jobs import write_databricks_jobs
+            cat, _, sch = (databricks_target or f"main.{_id(project_name)}").partition(".")
+            d = write_databricks_jobs(outs, out_dir, catalog=cat, schema=sch or _id(project_name), rendered_at=rendered_at, source_hash=shash, folder=f.name)
+            summary["databricks_jobs"] = summary.get("databricks_jobs", 0) + d["jobs"]
+            if d["failed"]: summary.setdefault("databricks_failed", []).extend(d["failed"])
         summary["folders"].append({"folder": f.name, "models": len([o for o in outs if o.decision != "skip"]), "skipped": len([o for o in outs if o.decision == "skip"]),
                                    "dags": dags, "todos": n_todo})
         summary["todos"] += n_todo; summary["dags"] = summary.get("dags", 0) + len(dags)

@@ -209,8 +209,10 @@ spark = (SparkSession.builder.appName(f"infa_{{MODEL}}")
          .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
          .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
          .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+         .config("spark.sql.catalog.glue_catalog.warehouse", [a.split("=", 1)[1] for a in sys.argv if a.startswith("--iceberg_warehouse=")][0]
+                 if any(a.startswith("--iceberg_warehouse=") for a in sys.argv) else sys.argv[sys.argv.index("--iceberg_warehouse") + 1])
          .getOrCreate())
-opts = getResolvedOptions(sys.argv, ["JOB_NAME"] + {arg_names})
+opts = getResolvedOptions(sys.argv, ["JOB_NAME", "iceberg_warehouse"] + {arg_names})
 for k, v in opts.items():
     for key in SQL: SQL[key] = SQL[key].replace("${{" + k + "}}", v)
 
@@ -246,7 +248,8 @@ def write_glue_jobs(outs: List[Any], out_dir: Path, *, target_db: str, source_db
         (jdir / f"{o.name}.py").write_text(Provenance(source_hash=source_hash, object=f"{folder}/{o.mapping}/{o.target}", template_id="informatica.glue_pyspark_job",
                                                      rendered_at=rendered_at).render(body, ".py"), encoding="utf-8")
         manifest.append({"Name": f"infa_{o.name}", "ScriptLocation": f"glue_jobs/{o.name}.py", "GlueVersion": "4.0", "Command": "glueetl",
-                         "DefaultArguments": {"--datalake-formats": "iceberg", "--enable-glue-datacatalog": "true", **{f"--{a}": "" for a in args}},
+                         "DefaultArguments": {"--datalake-formats": "iceberg", "--enable-glue-datacatalog": "true", "--iceberg_warehouse": "s3://<bucket>/<prefix>/",
+                                              **{f"--{a}": "" for a in args}},
                          "model": o.name, "materialization": o.materialization})
     (jdir / "jobs.json").write_text(json.dumps({"target_db": target_db, "jobs": manifest, "failed": failed}, indent=1), encoding="utf-8")
     return {"jobs": len(manifest), "failed": failed}

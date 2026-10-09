@@ -30,7 +30,8 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("input", type=Path); c.add_argument("--out", type=Path, required=True); c.add_argument("--project-name", default="informatica_conversion")
     c.add_argument("--profile"); c.add_argument("--no-iceberg", action="store_true")
     c.add_argument("--tier", type=int, choices=[1, 2], default=1, help="2 = also run the Claude-first modernizer agent on mappings with TODOs")
-    c.add_argument("--output", choices=["dbt", "dbt+glue-pyspark"], default="dbt", help="dbt (default) or also Glue 4.0 PySpark jobs under glue_jobs/")
+    c.add_argument("--output", choices=["dbt", "dbt+glue-pyspark", "dbt+databricks-jobs"], default="dbt", help="dbt (default), or also Glue 4.0 PySpark jobs (glue_jobs/) or Databricks notebooks + job specs (databricks_jobs/)")
+    c.add_argument("--databricks-target", help="Unity Catalog catalog.schema the Databricks jobs write to (default main.<project>)")
     c.add_argument("--glue-target-db", help="Glue database the PySpark jobs write to (default: the project name)")
     c.add_argument("--gate", type=Path, help="accepted discovery-gate answers file (.datapai/gate.json) — required unless --no-gate")
     c.add_argument("--no-gate", action="store_true", help="write the project without gate answers (dev / bench only; logged)")
@@ -137,7 +138,8 @@ def main(argv=None) -> int:
             sys.stderr.write("convert: --no-gate — project written WITHOUT human gate answers (dev/bench use only)\n")
         folders = parse_export_dir(a.input) if a.input.is_dir() else parse_export_all(a.input)
         summ = write_project(folders, a.out, project_name=a.project_name, profile=a.profile, iceberg=not a.no_iceberg, tier=a.tier,
-                             glue_pyspark=(a.output == "dbt+glue-pyspark"), glue_target_db=a.glue_target_db)
+                             glue_pyspark=(a.output == "dbt+glue-pyspark"), glue_target_db=a.glue_target_db,
+                             databricks_jobs=(a.output == "dbt+databricks-jobs"), databricks_target=a.databricks_target)
         if gate_rec: dg.write_answers(a.out, gate_rec); summ["gate"] = {"answered_by": gate_rec["answered_by"], "answered_at": gate_rec["answered_at"]}
         else: summ["gate"] = {"answered_by": None, "no_gate": True}
         print(json.dumps(summ, indent=2)); return 0
