@@ -84,7 +84,16 @@ def _load_config() -> Dict[str, str]:
     return _CACHE
 
 
-def questions(scope: str = "migration") -> List[Dict[str, Any]]:
+def questions(scope: str = "migration", regulations: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    """Scope questions plus the questions of each regulation pack named (e.g. ["APRA_CPS_234", "AU_PRIVACY_ACT"])."""
+    base = _scope_questions(scope)
+    if regulations:
+        from .regulation import pack_questions
+        base = base + pack_questions(regulations, _load_config())
+    return base
+
+
+def _scope_questions(scope: str) -> List[Dict[str, Any]]:
     raw = _load_config().get(f"questions.{scope}")
     if raw:
         try:
@@ -101,11 +110,11 @@ def require_for_convert() -> bool:
     return v in ("1", "true", "yes")
 
 
-def accept(scope: str, answers: Dict[str, Any], *, answered_by: str, notes: str = "") -> Dict[str, Any]:
-    """Validate human answers against the scope's questions. Raises GateError naming every failing question. Returns the record."""
+def accept(scope: str, answers: Dict[str, Any], *, answered_by: str, notes: str = "", regulations: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Validate human answers against the scope's questions (+ regulation packs). Raises GateError naming every failing question."""
     if not (answered_by or "").strip():
         raise GateError("answered_by: a named human must own the answers")
-    qs = questions(scope); problems: List[str] = []; clean: Dict[str, Any] = {}
+    qs = questions(scope, regulations); problems: List[str] = []; clean: Dict[str, Any] = {}
     for q in qs:
         v = answers.get(q["id"])
         sval = "" if v is None else str(v).strip()
@@ -125,7 +134,7 @@ def accept(scope: str, answers: Dict[str, Any], *, answered_by: str, notes: str 
         problems.append(f"unknown question ids: {unknown}")
     if problems:
         raise GateError("gate not satisfied:\n  - " + "\n  - ".join(problems))
-    rec = {"scope": scope, "answers": clean, "answered_by": answered_by.strip(), "answered_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    rec = {"scope": scope, "regulations": sorted(regulations or []), "answers": clean, "answered_by": answered_by.strip(), "answered_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
            "notes": notes, "questions_hash": hashlib.sha256(json.dumps(qs, sort_keys=True).encode()).hexdigest()}
     rec["hash"] = _hash(rec)
     return rec

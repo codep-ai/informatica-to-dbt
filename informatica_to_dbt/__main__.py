@@ -30,10 +30,13 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("input", type=Path); c.add_argument("--out", type=Path, required=True); c.add_argument("--project-name", default="informatica_conversion")
     c.add_argument("--profile"); c.add_argument("--no-iceberg", action="store_true")
     c.add_argument("--tier", type=int, choices=[1, 2], default=1, help="2 = also run the Claude-first modernizer agent on mappings with TODOs")
+    c.add_argument("--output", choices=["dbt", "dbt+glue-pyspark"], default="dbt", help="dbt (default) or also Glue 4.0 PySpark jobs under glue_jobs/")
+    c.add_argument("--glue-target-db", help="Glue database the PySpark jobs write to (default: the project name)")
     c.add_argument("--gate", type=Path, help="accepted discovery-gate answers file (.datapai/gate.json) — required unless --no-gate")
     c.add_argument("--no-gate", action="store_true", help="write the project without gate answers (dev / bench only; logged)")
     g = sub.add_parser("gate", help="discovery gate: print the questions, or accept a human's answers file")
-    g.add_argument("what", choices=["questions", "accept"]); g.add_argument("--scope", default="migration")
+    g.add_argument("what", choices=["questions", "accept", "pack"]); g.add_argument("--scope", default="migration")
+    g.add_argument("--regulation", action="append", help="regulation pack(s) to add: APRA_CPS_234 | APRA_CPG_235 | AU_PRIVACY_ACT | AUSTRAC_AML_CTF")
     g.add_argument("--answers", type=Path, help="accept: JSON {question_id: answer}"); g.add_argument("--by", help="accept: the human who answered")
     g.add_argument("--out", type=Path, help="accept: directory to write .datapai/gate.json into (the project dir)")
     r = sub.add_parser("report", help="run parse → classify → compile → write over a directory of exports and report per file")
@@ -104,14 +107,18 @@ def main(argv=None) -> int:
         print(json.dumps(fetch_public_corpus(a.dest, a.limit), indent=1)); return 0
     if a.cmd == "gate":
         from . import discovery_gate as dg
+        if a.what == "pack":
+            from agents.discovery_gate.regulation import PACKS, render_pack_md
+            for code in (a.regulation or sorted(PACKS)): print(render_pack_md(code, dg._load_config()))
+            return 0
         if a.what == "questions":
-            for q in dg.questions(a.scope):
+            for q in dg.questions(a.scope, a.regulation):
                 print(f"[{q['id']}] {'required' if q.get('required', True) else 'optional'}{'' if q.get('allow_default') else ', no default'}"
                       f"{' choices=' + '|'.join(q['choices']) if q.get('choices') else ''}\n    {q['q']}")
             return 0
         if not (a.answers and a.by and a.out): print("gate accept needs --answers, --by and --out", file=sys.stderr); return 2
         try:
-            rec = dg.accept(a.scope, json.loads(a.answers.read_text(encoding="utf-8")), answered_by=a.by)
+            rec = dg.accept(a.scope, json.loads(a.answers.read_text(encoding="utf-8")), answered_by=a.by, regulations=a.regulation)
         except dg.GateError as e:
             print(str(e), file=sys.stderr); return 3
         print(f"accepted → {dg.write_answers(a.out, rec)}"); return 0
@@ -129,7 +136,8 @@ def main(argv=None) -> int:
         elif a.no_gate:
             sys.stderr.write("convert: --no-gate — project written WITHOUT human gate answers (dev/bench use only)\n")
         folders = parse_export_dir(a.input) if a.input.is_dir() else parse_export_all(a.input)
-        summ = write_project(folders, a.out, project_name=a.project_name, profile=a.profile, iceberg=not a.no_iceberg, tier=a.tier)
+        summ = write_project(folders, a.out, project_name=a.project_name, profile=a.profile, iceberg=not a.no_iceberg, tier=a.tier,
+                             glue_pyspark=(a.output == "dbt+glue-pyspark"), glue_target_db=a.glue_target_db)
         if gate_rec: dg.write_answers(a.out, gate_rec); summ["gate"] = {"answered_by": gate_rec["answered_by"], "answered_at": gate_rec["answered_at"]}
         else: summ["gate"] = {"answered_by": None, "no_gate": True}
         print(json.dumps(summ, indent=2)); return 0

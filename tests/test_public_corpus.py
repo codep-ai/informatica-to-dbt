@@ -35,3 +35,27 @@ def test_every_genuine_export_builds(tmp_path):
     res = bench(src, tmp_path / "bench")
     s = res["summary"]
     assert s["models"] >= 20 and s["fail"] == 0, render_bench_md(res)
+
+
+def test_glue_pyspark_renders_for_every_genuine_model():
+    """Optional Glue output over the real corpus: every compiled model renders to a job and its SQL parses as Spark SQL."""
+    import json, re
+    import sqlglot
+    from informatica_to_dbt import parse_export_all
+    from informatica_to_dbt.compiler import compile_mapping
+    from informatica_to_dbt.corpus import genuine_exports
+    from informatica_to_dbt.glue_pyspark import render_job
+    rendered = failed = 0; errors = []
+    for f in genuine_exports(CORPUS):
+        for fo in parse_export_all(str(f)):
+            for m in fo.mappings:
+                for o in compile_mapping(m, fo):
+                    if o.decision == "skip" or not o.sql or any("SQL override used verbatim" in t for t in o.todos): continue
+                    try:
+                        js, _ = render_job(o.name, o.sql, target_db="tgt", materialization=o.materialization, unique_key=o.unique_key)
+                        for s in json.loads(js).values():
+                            sqlglot.parse_one(re.sub(r"\$\{\w+\}", "1900-01-01", s), read="spark")
+                        rendered += 1
+                    except Exception as exc:  # noqa: BLE001
+                        failed += 1; errors.append(f"{f.name}/{o.name}: {type(exc).__name__}: {str(exc)[:100]}")
+    assert rendered >= 20 and failed == 0, errors

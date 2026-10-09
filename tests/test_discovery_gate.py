@@ -64,3 +64,19 @@ def test_convert_refuses_without_gate(tmp_path, monkeypatch):
     write_answers(tmp_path / "g", accept("migration", _good(), answered_by="donny"))
     rc = main(["convert", str(ROOT / "sample_exports" / "SALES_DW.xml"), "--out", str(tmp_path / "p2"), "--gate", str(tmp_path / "g" / ".datapai" / "gate.json")])
     assert rc == 0 and (tmp_path / "p2" / ".datapai" / "gate.json").exists()
+
+
+def test_regulation_packs_add_required_questions():
+    from informatica_to_dbt.discovery_gate.regulation import PACKS, render_pack_md
+    assert set(PACKS) == {"APRA_CPS_234", "APRA_CPG_235", "AU_PRIVACY_ACT", "AUSTRAC_AML_CTF"}
+    qs = questions("migration", ["APRA_CPS_234", "AU_PRIVACY_ACT"])
+    ids = {q["id"] for q in qs}
+    assert {"cps234_asset_classification", "app_retention", "target_engine"} <= ids
+    with pytest.raises(GateError) as e:
+        accept("migration", _good(), answered_by="donny", regulations=["APRA_CPS_234"])
+    assert "cps234_asset_classification" in str(e.value)
+    rec = accept("migration", {**_good(), "cps234_asset_classification": "C2/S3 per the ISR; owner CISO", "cps234_access_control": "S3 columns: role pii_reader; break-glass via ticket",
+                               "cps234_incident_contact": "secops@bank; 72h path documented"}, answered_by="donny", regulations=["APRA_CPS_234"])
+    assert rec["regulations"] == ["APRA_CPS_234"]
+    md = render_pack_md("AU_PRIVACY_ACT", {})
+    assert "APP 11" in md and "app_retention" in md
