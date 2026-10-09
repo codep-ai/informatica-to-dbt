@@ -57,10 +57,10 @@ def test_convert_refuses_without_gate(tmp_path, monkeypatch):
     from informatica_to_dbt.__main__ import main
     from informatica_to_dbt import discovery_gate
     monkeypatch.setattr(discovery_gate, "require_for_convert", lambda: True)
-    rc = main(["convert", str(ROOT / "sample_exports" / "informatica" / "SALES_DW.xml"), "--out", str(tmp_path / "p")])
+    rc = main(["convert", str(ROOT / "sample_exports" / "SALES_DW.xml"), "--out", str(tmp_path / "p")])
     assert rc == 3 and not (tmp_path / "p" / "dbt_project.yml").exists()
-    rc = main(["convert", str(ROOT / "sample_exports" / "informatica" / "SALES_DW.xml"), "--out", str(tmp_path / "p"), "--no-gate"])
+    rc = main(["convert", str(ROOT / "sample_exports" / "SALES_DW.xml"), "--out", str(tmp_path / "p"), "--no-gate"])
     assert rc == 0 and (tmp_path / "p" / "dbt_project.yml").exists()
     write_answers(tmp_path / "g", accept("migration", _good(), answered_by="donny"))
-    rc = main(["convert", str(ROOT / "sample_exports" / "informatica" / "SALES_DW.xml"), "--out", str(tmp_path / "p2"), "--gate", str(tmp_path / "g" / ".datapai" / "gate.json")])
+    rc = main(["convert", str(ROOT / "sample_exports" / "SALES_DW.xml"), "--out", str(tmp_path / "p2"), "--gate", str(tmp_path / "g" / ".datapai" / "gate.json")])
     assert rc == 0 and (tmp_path / "p2" / ".datapai" / "gate.json").exists()
