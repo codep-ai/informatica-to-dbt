@@ -213,8 +213,10 @@ spark = (SparkSession.builder.appName(f"infa_{{MODEL}}")
                  if any(a.startswith("--iceberg_warehouse=") for a in sys.argv) else sys.argv[sys.argv.index("--iceberg_warehouse") + 1])
          .getOrCreate())
 opts = getResolvedOptions(sys.argv, ["JOB_NAME", "iceberg_warehouse"] + {arg_names})
-for k, v in opts.items():
-    for key in SQL: SQL[key] = SQL[key].replace("${{" + k + "}}", v)
+for k in {arg_names}:                                   # only the declared dbt vars; Glue passes other args (and None values) we must not touch
+    v = opts.get(k)
+    if v is None: continue
+    for key in SQL: SQL[key] = SQL[key].replace("${{" + k + "}}", str(v))
 
 target = f"glue_catalog.{{TARGET_DB}}.{{MODEL}}"
 exists = spark.catalog.tableExists(target)
