@@ -30,6 +30,12 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("input", type=Path); c.add_argument("--out", type=Path, required=True); c.add_argument("--project-name", default="informatica_conversion")
     c.add_argument("--profile"); c.add_argument("--no-iceberg", action="store_true")
     c.add_argument("--tier", type=int, choices=[1, 2], default=1, help="2 = also run the Claude-first modernizer agent on mappings with TODOs")
+    c.add_argument("--gate", type=Path, help="accepted discovery-gate answers file (.datapai/gate.json) — required unless --no-gate")
+    c.add_argument("--no-gate", action="store_true", help="write the project without gate answers (dev / bench only; logged)")
+    g = sub.add_parser("gate", help="discovery gate: print the questions, or accept a human's answers file")
+    g.add_argument("what", choices=["questions", "accept"]); g.add_argument("--scope", default="migration")
+    g.add_argument("--answers", type=Path, help="accept: JSON {question_id: answer}"); g.add_argument("--by", help="accept: the human who answered")
+    g.add_argument("--out", type=Path, help="accept: directory to write .datapai/gate.json into (the project dir)")
     r = sub.add_parser("report", help="run parse → classify → compile → write over a directory of exports and report per file")
     r.add_argument("input", type=Path); r.add_argument("--json", type=Path); r.add_argument("--out", type=Path)
     b = sub.add_parser("bench", help="real dbt build of every export on DuckDB (test bench); the acceptance gate")
@@ -96,11 +102,36 @@ def main(argv=None) -> int:
     if a.cmd == "fetch-public-corpus":
         from .corpus import fetch_public_corpus
         print(json.dumps(fetch_public_corpus(a.dest, a.limit), indent=1)); return 0
+    if a.cmd == "gate":
+        from . import discovery_gate as dg
+        if a.what == "questions":
+            for q in dg.questions(a.scope):
+                print(f"[{q['id']}] {'required' if q.get('required', True) else 'optional'}{'' if q.get('allow_default') else ', no default'}"
+                      f"{' choices=' + '|'.join(q['choices']) if q.get('choices') else ''}\n    {q['q']}")
+            return 0
+        if not (a.answers and a.by and a.out): print("gate accept needs --answers, --by and --out", file=sys.stderr); return 2
+        try:
+            rec = dg.accept(a.scope, json.loads(a.answers.read_text(encoding="utf-8")), answered_by=a.by)
+        except dg.GateError as e:
+            print(str(e), file=sys.stderr); return 3
+        print(f"accepted → {dg.write_answers(a.out, rec)}"); return 0
     if a.cmd == "convert":
+        from . import discovery_gate as dg
         from .parser import parse_export_dir
         from .project import write_project
+        gate_rec = None
+        if a.gate:
+            try: gate_rec = dg.load_answers(a.gate)
+            except Exception as e: print(f"gate: {e}", file=sys.stderr); return 3
+        elif dg.require_for_convert() and not a.no_gate:
+            print("convert refused: no discovery-gate answers. Run `gate questions`, have a human answer, `gate accept --answers … --by … --out …`, "
+                  "then pass --gate <dir>/.datapai/gate.json (or --no-gate for dev/bench; logged).", file=sys.stderr); return 3
+        elif a.no_gate:
+            sys.stderr.write("convert: --no-gate — project written WITHOUT human gate answers (dev/bench use only)\n")
         folders = parse_export_dir(a.input) if a.input.is_dir() else parse_export_all(a.input)
         summ = write_project(folders, a.out, project_name=a.project_name, profile=a.profile, iceberg=not a.no_iceberg, tier=a.tier)
+        if gate_rec: dg.write_answers(a.out, gate_rec); summ["gate"] = {"answered_by": gate_rec["answered_by"], "answered_at": gate_rec["answered_at"]}
+        else: summ["gate"] = {"answered_by": None, "no_gate": True}
         print(json.dumps(summ, indent=2)); return 0
     results = assess_export(a.input, report_html=a.html, report_md=a.md, results_json=a.json)
     print(render_assessment_md(results, inputs=[str(a.input)]))
